@@ -13,6 +13,7 @@ from typing import List, Dict, Any, Optional
 # import matplotlib.pyplot as plt # Matplotlib might be less useful in a basic webapp unless plotting graphs
 import streamlit as st
 import tempfile
+import concurrent.futures # Add this import
 
 # RAG imports
 from langchain_community.document_loaders import PyMuPDFLoader
@@ -319,215 +320,228 @@ def setup_neo4j_schema(graph):
         raise # Re-raise to stop processing if schema fails critically
 
 
-def create_knowledge_graph(graph, chunks, source_metadata, api_key):
-    """Create a knowledge graph from the document chunks"""
-    logger.info("Starting knowledge graph creation")
-    st.info("Building knowledge graph... This can take a while.")
-    total_chunks = len(chunks)
-    progress_bar = st.progress(0, text="Initializing graph build...")
-
+# Define a helper function for concurrent entity extraction
+def extract_entities_task(chunk, api_key, model_name, base_url):
+    """
+    Task function to extract entities for a single chunk using a temporary LLM client.
+    Handles API calls and basic JSON parsing.
+    """
+    chunk_id = chunk.metadata['chunk_id']
+    logger.debug(f"Starting entity extraction task for chunk {chunk_id}")
     try:
-        # Create nodes for source documents
-        for source, metadata in source_metadata.items():
-            logger.debug(f"Creating document node for {source}")
-            query = """
-            MERGE (d:Document {id: $id})
-            SET d.title = $title,
-                d.pages = $pages,
-                d.processed_at = $processed_at,
-                d.source = $id // Add source property for indexing
-            """
-            params = {
-                "id": metadata["filename"],
-                "title": metadata["filename"],
-                "pages": metadata["pages"],
-                "processed_at": metadata["processed_at"]
-            }
-            graph.query(query, params=params)
-
-        # Setup LLM client (using DeepSeekLLM)
-        # Ensure API key is valid before proceeding
-        if not api_key: # Basic check
-            st.error("Invalid or missing DeepSeek API Key.")
-            logger.error("Invalid or missing DeepSeek API Key for graph creation.")
-            return False # Indicate failure
-
-        # Instantiate the DeepSeekLLM class
-        llm_client = DeepSeekLLM(
+        # Create a *new*, temporary LLM instance for this task
+        # Note: This instance won't share history with others or the main Q&A LLM
+        temp_llm_client = DeepSeekLLM(
             api_key=api_key,
-            # model= can override default here if needed, e.g., model="deepseek-coder"
-            max_tokens=256, # Keep entity extraction concise
-            temperature=0.1
-            # api_base_url is set in the class definition
+            model=model_name, # Use the reasoner or another suitable model
+            max_tokens=256,
+            temperature=0.1,
+            api_base_url=base_url,
+            messages=[] # Ensure it starts with empty history
         )
 
-        # Process each chunk
-        for i, chunk in enumerate(chunks):
-            progress_text = f"Processing chunk {i+1}/{total_chunks} ({chunk.metadata['chunk_id']})..."
-            progress_bar.progress((i + 1) / total_chunks, text=progress_text)
-            logger.info(f"Processing chunk {i+1}/{total_chunks}")
+        entity_prompt = f"""
+        Extract key named entities (Person, Organization, Location, Product, Technology) and important concepts/topics from the text below.
+        Return them as a JSON list of objects, each with "name" (string) and "type" (string, e.g., "Person", "Concept", "Technology").
+        Focus on relevance and significance within the context. Limit to the most important 5-7 items if many exist.
 
+        TEXT:
+        {chunk.page_content[:1500]} # Limit context size
+
+        JSON RESPONSE (list of objects):
+        """
+        logger.info(f"Attempting LLM entity extraction for chunk {chunk_id}. Prompt length: {len(entity_prompt)}")
+        entity_response = temp_llm_client.invoke(entity_prompt) # Uses the _call method with timeout
+        logger.info(f"LLM entity extraction successful for chunk {chunk_id}. Response length: {len(entity_response)}")
+
+        # Parse JSON robustly (same logic as before)
+        entities = []
+        try:
+            json_match = re.search(r'\[.*?\]', entity_response, re.DOTALL)
+            if json_match:
+                entities = json.loads(json_match.group(0))
+            else:
+                json_match = re.search(r'\{.*?\}', entity_response, re.DOTALL)
+                if json_match:
+                     try:
+                         potential_json = json_match.group(0)
+                         if potential_json.count('{') > 1 and potential_json.count('}') > 1:
+                              entities = json.loads(f"[{potential_json}]")
+                         else:
+                              entities = [json.loads(potential_json)]
+                     except json.JSONDecodeError:
+                          logger.warning(f"Could not decode JSON fragment in entity response for chunk {chunk_id}. Response: {entity_response[:200]}...")
+                          entities = []
+                else:
+                    logger.warning(f"No JSON list or object found in entity response for chunk {chunk_id}. Response: {entity_response[:200]}...")
+                    entities = []
+        except json.JSONDecodeError as json_e:
+            logger.warning(f"Failed to parse entity JSON for chunk {chunk_id}: {json_e}. Response: {entity_response[:200]}...")
+            entities = []
+        except Exception as parse_e:
+            logger.warning(f"Unexpected error parsing entity JSON for chunk {chunk_id}: {parse_e}. Response: {entity_response[:200]}...")
+            entities = []
+
+        return chunk_id, entities
+
+    except Exception as e:
+        logger.error(f"Entity extraction task failed for chunk {chunk_id}: {e}", exc_info=False) # Keep log concise
+        # Return the error to be handled later
+        return chunk_id, e # Return chunk_id and the exception object
+
+
+def create_knowledge_graph(graph, chunks, source_metadata, api_key):
+    """Create a knowledge graph from the document chunks using concurrent entity extraction."""
+    logger.info("Starting knowledge graph creation with concurrent processing.")
+    st.info("Building knowledge graph (concurrent)... This can take a while.")
+    total_chunks = len(chunks)
+    progress_bar = st.progress(0, text="Initializing graph build...")
+    processed_chunks = 0
+
+    # Set the maximum number of concurrent workers (tune carefully based on API limits/performance)
+    MAX_WORKERS = 5 # Start with a conservative number
+    logger.info(f"Using up to {MAX_WORKERS} concurrent workers for entity extraction.")
+
+    # Store base LLM parameters
+    base_model_name = "deepseek-reasoner" # Or choose model for extraction
+    base_api_url = "https://api.deepseek.com/v1"
+
+    # --- Step 1: Create Chunk Nodes (Sequentially first) ---
+    st.info("Creating base chunk nodes in the graph...")
+    logger.info("Creating all chunk nodes sequentially first.")
+    for i, chunk in enumerate(chunks):
+        chunk_id = chunk.metadata['chunk_id']
+        source_doc = chunk.metadata['source_document']
+        page_num = chunk.metadata.get('page', 0)
+        try:
+            query = """
+            MATCH (d:Document {id: $doc_id})
+            MERGE (c:Chunk {id: $chunk_id})
+            SET c.text = $text,
+                c.page_num = $page_num,
+                c.source_document = $doc_id
+            MERGE (d)-[:CONTAINS]->(c)
+            """
+            params = {
+                "chunk_id": chunk_id,
+                "text": chunk.page_content,
+                "page_num": page_num,
+                "doc_id": source_doc
+            }
+            graph.query(query, params=params)
+        except Exception as e:
+             logger.error(f"Error creating chunk node {chunk_id} or linking: {e}", exc_info=True)
+             st.warning(f"Skipping chunk node creation for {chunk_id} due to error. This may affect subsequent steps.")
+             # Decide if you want to skip this chunk entirely for entity extraction
+             # For now, we let it proceed, but entity extraction might fail if node doesn't exist
+        progress_bar.progress((i + 1) / (total_chunks * 2), text=f"Creating chunk nodes {i+1}/{total_chunks}") # Adjust progress denominator
+
+    # --- Step 2: Concurrent Entity Extraction ---
+    logger.info("Starting concurrent entity extraction.")
+    st.info(f"Extracting entities using up to {MAX_WORKERS} concurrent workers...")
+    results = {} # Dictionary to store results: {chunk_id: entities_or_error}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        future_to_chunk = {
+            executor.submit(extract_entities_task, chunk, api_key, base_model_name, base_api_url): chunk
+            for chunk in chunks
+        }
+
+        # Process completed tasks
+        for future in concurrent.futures.as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
             chunk_id = chunk.metadata['chunk_id']
-            source_doc = chunk.metadata['source_document']
-            page_num = chunk.metadata.get('page', 0)
-
-            # Create chunk node and link to document first
             try:
-                logger.debug(f"Creating chunk node {chunk_id} and linking to document {source_doc}")
-                # Use 'text' for content to align with Neo4jVector defaults
-                query = """
-                MATCH (d:Document {id: $doc_id})
-                MERGE (c:Chunk {id: $chunk_id})
-                SET c.text = $text,
-                    c.page_num = $page_num,
-                    c.source_document = $doc_id // Add redundant link info if needed
-                MERGE (d)-[:CONTAINS]->(c)
-                """
-                params = {
-                    "chunk_id": chunk_id,
-                    "text": chunk.page_content, # Use 'text'
-                    "page_num": page_num,
-                    "doc_id": source_doc
-                }
-                graph.query(query, params=params)
-            except Exception as e:
-                 logger.error(f"Error creating chunk node {chunk_id} or linking: {e}", exc_info=True)
-                 st.warning(f"Skipping chunk node creation for {chunk_id} due to error.")
-                 continue # Skip entity extraction if chunk creation fails
+                c_id, result_data = future.result()
+                results[c_id] = result_data # Store entities list or Exception object
+                if isinstance(result_data, Exception):
+                    st.warning(f"Entity extraction failed for chunk {c_id}: {result_data}")
+                # else:
+                #     logger.debug(f"Successfully extracted {len(result_data)} entities for chunk {c_id}")
 
-            # Extract entities using LLM
-            entities = [] # Default to empty list
-            try:
-                logger.debug(f"Extracting entities from chunk {chunk_id}")
-                entity_prompt = f"""
-                Extract key named entities (Person, Organization, Location, Product, Technology) and important concepts/topics from the text below.
-                Return them as a JSON list of objects, each with "name" (string) and "type" (string, e.g., "Person", "Concept", "Technology").
-                Focus on relevance and significance within the context. Limit to the most important 5-7 items if many exist.
+            except Exception as exc:
+                logger.error(f'Chunk {chunk_id} generated an exception during future processing: {exc}', exc_info=True)
+                results[chunk_id] = exc # Store the exception
+                st.error(f"Error processing result for chunk {chunk_id}: {exc}")
 
-                TEXT:
-                {chunk.page_content[:1500]} # Limit context size
+            processed_chunks += 1
+            progress_bar.progress(0.5 + (processed_chunks / (total_chunks * 2)), text=f"Extracting entities {processed_chunks}/{total_chunks}") # Adjust progress
 
-                JSON RESPONSE (list of objects):
-                """
-                # ADD LOGGING HERE
-                logger.info(f"Attempting LLM entity extraction for chunk {chunk_id}. Prompt length: {len(entity_prompt)}")
-                # Log first few chars of the prompt content (be careful with sensitive data if any)
-                logger.debug(f"Prompt preview for chunk {chunk_id}: {entity_prompt[:200]}...")
+    # --- Step 3: Create Entity Nodes and Relationships (Sequentially from results) ---
+    logger.info("Processing entity extraction results and updating graph.")
+    st.info("Adding extracted entities and relationships to the graph...")
+    entities_added_count = 0
+    processed_entities_step = 0
 
-                # Use the instantiated client
-                entity_response = llm_client.invoke(entity_prompt)
+    for chunk_id, extracted_data in results.items():
+        processed_entities_step += 1
+        progress_bar.progress(0.75 + (processed_entities_step / (total_chunks * 4)), text=f"Adding entities to graph {processed_entities_step}/{total_chunks}") # Adjust progress
 
-                # ADD LOGGING HERE
-                logger.info(f"LLM entity extraction successful for chunk {chunk_id}. Response length: {len(entity_response)}")
-                logger.debug(f"Response preview for chunk {chunk_id}: {entity_response[:200]}...")
+        if isinstance(extracted_data, Exception) or not extracted_data:
+            # Skip chunks where extraction failed or returned no entities
+            if isinstance(extracted_data, Exception):
+                 logger.warning(f"Skipping graph update for chunk {chunk_id} due to previous extraction error: {extracted_data}")
+            # else: logger.debug(f"No entities to add for chunk {chunk_id}")
+            continue
 
+        # 'extracted_data' should be the list of entities here
+        entities = extracted_data
+        for entity in entities:
+             if not isinstance(entity, dict) or 'name' not in entity or 'type' not in entity:
+                 logger.warning(f"Invalid entity format skipped: {entity} in chunk {chunk_id}")
+                 continue
+             entity_name = str(entity.get('name')).strip()
+             entity_type = str(entity.get('type')).strip().capitalize()
+             if not entity_name or not entity_type: continue # Skip if invalid
 
-                # Parse JSON robustly
-                try:
-                    json_match = re.search(r'\[.*?\]', entity_response, re.DOTALL) # Look for list first
-                    if json_match:
-                        entities = json.loads(json_match.group(0))
-                    else:
-                        # Fallback for single object or malformed lists
-                        json_match = re.search(r'\{.*?\}', entity_response, re.DOTALL)
-                        if json_match:
-                             try:
-                                 # Attempt to parse as list of objects even if brackets are missing
-                                 potential_json = json_match.group(0)
-                                 # Simple heuristic: if it contains commas inside curly braces, maybe it's a list
-                                 if potential_json.count('{') > 1 and potential_json.count('}') > 1:
-                                      entities = json.loads(f"[{potential_json}]")
-                                 else: # Assume single object
-                                      entities = [json.loads(potential_json)] # Wrap single dict in list
-                             except json.JSONDecodeError:
-                                  logger.warning(f"Could not decode JSON fragment in entity response for chunk {chunk_id}. Response: {entity_response[:200]}...")
-                                  entities = []
-                        else:
-                            logger.warning(f"No JSON list or object found in entity response for chunk {chunk_id}. Response: {entity_response[:200]}...")
-                            entities = []
+             clean_name_part = re.sub(r'\s+', '_', re.sub(r'[^\w\s-]', '', entity_name).strip()).lower()
+             clean_type_part = re.sub(r'\s+', '_', entity_type).lower()
+             entity_id = f"{clean_name_part}_{clean_type_part}"[:255]
+             node_label = "Concept" if entity_type.lower() in ["concept", "topic"] else "Entity"
 
-                except json.JSONDecodeError as json_e:
-                    logger.warning(f"Failed to parse entity JSON for chunk {chunk_id}: {json_e}. Response: {entity_response[:200]}...")
-                    entities = []
-                except Exception as parse_e: # Catch other potential errors
-                    logger.warning(f"Unexpected error parsing entity JSON for chunk {chunk_id}: {parse_e}. Response: {entity_response[:200]}...")
-                    entities = []
+             try:
+                 logger.debug(f"Creating {node_label} node {entity_id} ({entity_name}) and linking to chunk {chunk_id}")
+                 query = f"""
+                 MERGE (e:{node_label} {{id: $entity_id}})
+                 ON CREATE SET e.name = $name, e.type = $type
+                 WITH e
+                 MATCH (c:Chunk {{id: $chunk_id}})
+                 MERGE (c)-[r:MENTIONS {{type: $type}}]->(e)
+                 """
+                 params = { "entity_id": entity_id, "name": entity_name, "type": entity_type, "chunk_id": chunk_id }
+                 graph.query(query, params=params)
+                 entities_added_count += 1
+             except Exception as e:
+                  logger.error(f"Error creating {node_label} node {entity_id} or relationship: {e}", exc_info=True)
+                  st.warning(f"Failed to create/link entity {entity_name} from chunk {chunk_id}.")
+                  continue # Continue with the next entity
 
-            except Exception as llm_e:
-                 # Log the specific error encountered (ValueError from timeout/API error, or others)
-                 logger.error(f"LLM call failed for entity extraction on chunk {chunk_id}: {llm_e}", exc_info=True)
-                 st.warning(f"Skipping entity extraction for chunk {chunk_id} due to LLM/API error: {llm_e}")
-                 # Ensure the loop continues to the next chunk
-                 continue # <--- ADD OR ENSURE THIS IS PRESENT
+    logger.info(f"Added {entities_added_count} entity mentions to the graph.")
 
-            # Create entity nodes and relationships if entities were extracted
-            if entities:
-                for entity in entities:
-                    if not isinstance(entity, dict) or 'name' not in entity or 'type' not in entity:
-                        logger.warning(f"Invalid entity format skipped: {entity} in chunk {chunk_id}")
-                        continue
-
-                    entity_name = str(entity.get('name')).strip()
-                    entity_type = str(entity.get('type')).strip().capitalize() # Standardize type capitalization
-
-                    if not entity_name or not entity_type:
-                        logger.warning(f"Missing name or type for entity: {entity} in chunk {chunk_id}")
-                        continue
-
-                    # Create a unique ID for the entity node (combination of name and type)
-                    clean_name_part = re.sub(r'\s+', '_', re.sub(r'[^\w\s-]', '', entity_name).strip()).lower()
-                    clean_type_part = re.sub(r'\s+', '_', entity_type).lower()
-                    entity_id = f"{clean_name_part}_{clean_type_part}"[:255] # Limit ID length
-
-                    # Use appropriate label based on type (Entity or Concept)
-                    node_label = "Concept" if entity_type.lower() in ["concept", "topic"] else "Entity"
-
-                    try:
-                        # Create node and link to chunk
-                        logger.debug(f"Creating {node_label} node {entity_id} ({entity_name}) and linking to chunk {chunk_id}")
-                        query = f"""
-                        MERGE (e:{node_label} {{id: $entity_id}})
-                        ON CREATE SET e.name = $name, e.type = $type
-                        WITH e
-                        MATCH (c:Chunk {{id: $chunk_id}})
-                        MERGE (c)-[r:MENTIONS {{type: $type}}]->(e)
-                        """
-                        params = {
-                            "entity_id": entity_id,
-                            "name": entity_name,
-                            "type": entity_type, # Store original extracted type
-                            "chunk_id": chunk_id
-                        }
-                        graph.query(query, params=params)
-                    except Exception as e:
-                         logger.error(f"Error creating {node_label} node {entity_id} or relationship: {e}", exc_info=True)
-                         st.warning(f"Failed to create/link entity {entity_name} from chunk {chunk_id}.")
-                         # Continue with the next entity
-
-        progress_bar.progress(1.0, text="Linking related entities...")
-        logger.info("Creating connections between related entities within the same chunk context...")
-        # Link entities mentioned in the same chunk
-        # Consider separate queries for Entity-Entity and Concept-Concept/Entity-Concept if needed
+    # --- Step 4: Link Related Entities ---
+    progress_bar.progress(0.95, text="Linking related entities...")
+    logger.info("Creating connections between related entities within the same chunk context...")
+    try:
         query = """
-        MATCH (c:Chunk)-[:MENTIONS]->(e1) // e1 can be Entity or Concept
-        MATCH (c)-[:MENTIONS]->(e2) // e2 can be Entity or Concept
-        WHERE id(e1) < id(e2) // Avoid self-loops and duplicate relationships
+        MATCH (c:Chunk)-[:MENTIONS]->(e1)
+        MATCH (c)-[:MENTIONS]->(e2)
+        WHERE id(e1) < id(e2)
         MERGE (e1)-[r:RELATED_TO]->(e2)
         ON CREATE SET r.weight = 1
         ON MATCH SET r.weight = r.weight + 1
         """
         graph.query(query)
-
-        logger.info("Knowledge graph structure creation completed.")
-        st.success("Knowledge graph structure built successfully!")
-        progress_bar.empty() # Remove progress bar
-        return True # Indicate success
-
+        logger.info("Finished linking related entities.")
     except Exception as e:
-        logger.error(f"Critical error during knowledge graph creation: {str(e)}", exc_info=True)
-        st.error(f"Failed to build knowledge graph: {e}")
-        progress_bar.empty()
-        return False # Indicate failure
+        logger.error(f"Failed to link related entities: {e}", exc_info=True)
+        st.error(f"Error during final relationship linking: {e}")
+        # Decide if this error is critical enough to return False
+
+    progress_bar.progress(1.0, text="Knowledge graph structure build completed!")
+    st.success("Knowledge graph structure built successfully!")
+    progress_bar.empty()
+    return True # Indicate success
 
 def setup_vector_index(chunks, embedding_function, neo4j_uri, neo4j_username, neo4j_password):
     """Setup vector embeddings in Neo4j for semantic search"""
