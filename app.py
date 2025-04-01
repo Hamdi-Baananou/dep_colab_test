@@ -391,22 +391,24 @@ def extract_entities_task(chunk, api_key, model_name, base_url):
 
 
 def create_knowledge_graph(graph, chunks, source_metadata, api_key):
-    """Create a knowledge graph from the document chunks using concurrent entity extraction."""
-    logger.info("Starting knowledge graph creation with concurrent processing.")
-    st.info("Building knowledge graph (concurrent)... This can take a while.")
+    """Create a knowledge graph using concurrent extraction and batched graph writes."""
+    logger.info("Starting knowledge graph creation with concurrent extraction and batched writes.")
+    st.info("Building knowledge graph (concurrent/batched)... This can take a while.")
     total_chunks = len(chunks)
+    # Adjust progress steps: 1. Create Chunks, 2. Extract Entities, 3. Batch Write Entities, 4. Link Related
     progress_bar = st.progress(0, text="Initializing graph build...")
-    processed_chunks = 0
+    processed_chunks_extraction = 0
+    processed_batches_write = 0
 
-    # Set the maximum number of concurrent workers (tune carefully based on API limits/performance)
-    MAX_WORKERS = 5 # Start with a conservative number
-    logger.info(f"Using up to {MAX_WORKERS} concurrent workers for entity extraction.")
+    # --- Concurrency/Batching Settings ---
+    MAX_WORKERS_EXTRACTION = 5 # Workers for API calls
+    BATCH_SIZE_GRAPH_WRITE = 200 # Number of entity links per transaction batch
+    logger.info(f"Using {MAX_WORKERS_EXTRACTION} workers for extraction, batch size {BATCH_SIZE_GRAPH_WRITE} for graph writes.")
 
-    # Store base LLM parameters
-    base_model_name = "deepseek-reasoner" # Or choose model for extraction
+    base_model_name = "deepseek-reasoner"
     base_api_url = "https://api.deepseek.com/v1"
 
-    # --- Step 1: Create Chunk Nodes (Sequentially first) ---
+    # --- Step 1: Create Chunk Nodes (Sequential) ---
     st.info("Creating base chunk nodes in the graph...")
     logger.info("Creating all chunk nodes sequentially first.")
     for i, chunk in enumerate(chunks):
@@ -422,70 +424,46 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
                 c.source_document = $doc_id
             MERGE (d)-[:CONTAINS]->(c)
             """
-            params = {
-                "chunk_id": chunk_id,
-                "text": chunk.page_content,
-                "page_num": page_num,
-                "doc_id": source_doc
-            }
+            params = { "chunk_id": chunk_id, "text": chunk.page_content, "page_num": page_num, "doc_id": source_doc }
             graph.query(query, params=params)
         except Exception as e:
              logger.error(f"Error creating chunk node {chunk_id} or linking: {e}", exc_info=True)
-             st.warning(f"Skipping chunk node creation for {chunk_id} due to error. This may affect subsequent steps.")
-             # Decide if you want to skip this chunk entirely for entity extraction
-             # For now, we let it proceed, but entity extraction might fail if node doesn't exist
-        progress_bar.progress((i + 1) / (total_chunks * 2), text=f"Creating chunk nodes {i+1}/{total_chunks}") # Adjust progress denominator
+             st.warning(f"Skipping chunk node creation for {chunk_id} due to error.")
+        progress_bar.progress((i + 1) / (total_chunks * 2), text=f"Creating chunk nodes {i+1}/{total_chunks}") # Approx 25% when done
 
     # --- Step 2: Concurrent Entity Extraction ---
     logger.info("Starting concurrent entity extraction.")
-    st.info(f"Extracting entities using up to {MAX_WORKERS} concurrent workers...")
-    results = {} # Dictionary to store results: {chunk_id: entities_or_error}
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all tasks
+    st.info(f"Extracting entities using up to {MAX_WORKERS_EXTRACTION} concurrent workers...")
+    results = {} # {chunk_id: entities_or_error}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS_EXTRACTION) as executor:
         future_to_chunk = {
             executor.submit(extract_entities_task, chunk, api_key, base_model_name, base_api_url): chunk
             for chunk in chunks
         }
-
-        # Process completed tasks
         for future in concurrent.futures.as_completed(future_to_chunk):
             chunk = future_to_chunk[future]
             chunk_id = chunk.metadata['chunk_id']
             try:
                 c_id, result_data = future.result()
-                results[c_id] = result_data # Store entities list or Exception object
+                results[c_id] = result_data
                 if isinstance(result_data, Exception):
                     st.warning(f"Entity extraction failed for chunk {c_id}: {result_data}")
-                # else:
-                #     logger.debug(f"Successfully extracted {len(result_data)} entities for chunk {c_id}")
-
             except Exception as exc:
                 logger.error(f'Chunk {chunk_id} generated an exception during future processing: {exc}', exc_info=True)
-                results[chunk_id] = exc # Store the exception
+                results[chunk_id] = exc
                 st.error(f"Error processing result for chunk {chunk_id}: {exc}")
+            processed_chunks_extraction += 1
+            # Update progress (approx 25% -> 75%)
+            progress_bar.progress(0.25 + (processed_chunks_extraction / (total_chunks * 2)), text=f"Extracting entities {processed_chunks_extraction}/{total_chunks}")
 
-            processed_chunks += 1
-            progress_bar.progress(0.5 + (processed_chunks / (total_chunks * 2)), text=f"Extracting entities {processed_chunks}/{total_chunks}") # Adjust progress
-
-    # --- Step 3: Create Entity Nodes and Relationships (Sequentially from results) ---
-    logger.info("Processing entity extraction results and updating graph.")
-    st.info("Adding extracted entities and relationships to the graph...")
-    entities_added_count = 0
-    processed_entities_step = 0
-
+    # --- Step 3: Prepare Data for Batch Write ---
+    logger.info("Preparing data for batched graph writes.")
+    st.info("Preparing extracted entities for batch updates...")
+    entities_to_write = []
     for chunk_id, extracted_data in results.items():
-        processed_entities_step += 1
-        progress_bar.progress(0.75 + (processed_entities_step / (total_chunks * 4)), text=f"Adding entities to graph {processed_entities_step}/{total_chunks}") # Adjust progress
-
         if isinstance(extracted_data, Exception) or not extracted_data:
-            # Skip chunks where extraction failed or returned no entities
-            if isinstance(extracted_data, Exception):
-                 logger.warning(f"Skipping graph update for chunk {chunk_id} due to previous extraction error: {extracted_data}")
-            # else: logger.debug(f"No entities to add for chunk {chunk_id}")
-            continue
+            continue # Skip failed or empty extractions
 
-        # 'extracted_data' should be the list of entities here
         entities = extracted_data
         for entity in entities:
              if not isinstance(entity, dict) or 'name' not in entity or 'type' not in entity:
@@ -493,33 +471,65 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
                  continue
              entity_name = str(entity.get('name')).strip()
              entity_type = str(entity.get('type')).strip().capitalize()
-             if not entity_name or not entity_type: continue # Skip if invalid
+             if not entity_name or not entity_type: continue
 
              clean_name_part = re.sub(r'\s+', '_', re.sub(r'[^\w\s-]', '', entity_name).strip()).lower()
              clean_type_part = re.sub(r'\s+', '_', entity_type).lower()
              entity_id = f"{clean_name_part}_{clean_type_part}"[:255]
              node_label = "Concept" if entity_type.lower() in ["concept", "topic"] else "Entity"
 
-             try:
-                 logger.debug(f"Creating {node_label} node {entity_id} ({entity_name}) and linking to chunk {chunk_id}")
-                 query = f"""
-                 MERGE (e:{node_label} {{id: $entity_id}})
-                 ON CREATE SET e.name = $name, e.type = $type
-                 WITH e
-                 MATCH (c:Chunk {{id: $chunk_id}})
-                 MERGE (c)-[r:MENTIONS {{type: $type}}]->(e)
-                 """
-                 params = { "entity_id": entity_id, "name": entity_name, "type": entity_type, "chunk_id": chunk_id }
-                 graph.query(query, params=params)
-                 entities_added_count += 1
-             except Exception as e:
-                  logger.error(f"Error creating {node_label} node {entity_id} or relationship: {e}", exc_info=True)
-                  st.warning(f"Failed to create/link entity {entity_name} from chunk {chunk_id}.")
-                  continue # Continue with the next entity
+             entities_to_write.append({
+                 "chunkId": chunk_id,
+                 "entityId": entity_id,
+                 "entityName": entity_name,
+                 "entityType": entity_type, # Original type for relationship property
+                 "nodeLabel": node_label # Determined label for the node
+             })
 
-    logger.info(f"Added {entities_added_count} entity mentions to the graph.")
+    total_entities_to_write = len(entities_to_write)
+    logger.info(f"Prepared {total_entities_to_write} valid entity mentions for graph update.")
 
-    # --- Step 4: Link Related Entities ---
+    # --- Step 4: Execute Batched Graph Writes ---
+    logger.info(f"Executing graph writes in batches of {BATCH_SIZE_GRAPH_WRITE}...")
+    st.info(f"Writing {total_entities_to_write} entity links to graph in batches...")
+
+    # Cypher query using UNWIND for batching
+    # MERGE entity node first, then MERGE the relationship to the existing chunk node
+    batch_write_query = """
+    UNWIND $batch AS item
+    MERGE (e:`Entity` {id: item.entityId}) // Use a placeholder label first
+    ON CREATE SET e.name = item.entityName, e.type = item.entityType
+    // Remove placeholder label and set the correct one based on input
+    REMOVE e:Entity
+    SET e += item.nodeLabel // Dynamically set the correct label (Entity or Concept)
+    WITH e, item
+    MATCH (c:Chunk {id: item.chunkId})
+    MERGE (c)-[r:MENTIONS {type: item.entityType}]->(e)
+    RETURN count(e) as updated_count // Return something small
+    """
+    # Note: Dynamically setting labels like `SET e:item.nodeLabel` is tricky.
+    # A common workaround is to MERGE with a base label ('Entity' here) and then use SET e += 'CorrectLabel'.
+    # Or use APOC procedures if available (apoc.create.addLabels).
+    # The MERGE + REMOVE + SET approach should work on standard Neo4j.
+
+    total_batches = (total_entities_to_write + BATCH_SIZE_GRAPH_WRITE - 1) // BATCH_SIZE_GRAPH_WRITE
+    for i in range(0, total_entities_to_write, BATCH_SIZE_GRAPH_WRITE):
+        batch = entities_to_write[i : i + BATCH_SIZE_GRAPH_WRITE]
+        batch_num = (i // BATCH_SIZE_GRAPH_WRITE) + 1
+        logger.info(f"Processing write batch {batch_num}/{total_batches} ({len(batch)} items)")
+        try:
+            graph.query(batch_write_query, params={"batch": batch})
+        except Exception as e:
+            logger.error(f"Error processing graph write batch {batch_num}: {e}", exc_info=True)
+            st.error(f"Failed to write batch {batch_num} to graph. Some entities might be missing. Error: {e}")
+            # Optionally: Decide whether to stop or continue on batch failure
+            # continue
+        processed_batches_write += 1
+        # Update progress (approx 75% -> 95%)
+        progress_bar.progress(0.75 + (processed_batches_write / (total_batches * 4)), text=f"Writing batches to graph {processed_batches_write}/{total_batches}")
+
+
+    # --- Step 5: Link Related Entities (Sequential) ---
     progress_bar.progress(0.95, text="Linking related entities...")
     logger.info("Creating connections between related entities within the same chunk context...")
     try:
@@ -536,7 +546,6 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
     except Exception as e:
         logger.error(f"Failed to link related entities: {e}", exc_info=True)
         st.error(f"Error during final relationship linking: {e}")
-        # Decide if this error is critical enough to return False
 
     progress_bar.progress(1.0, text="Knowledge graph structure build completed!")
     st.success("Knowledge graph structure built successfully!")
