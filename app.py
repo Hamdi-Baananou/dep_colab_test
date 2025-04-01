@@ -33,19 +33,19 @@ import requests
 # Original Code (Functions adapted for Streamlit)
 # =============================
 
-# Custom OpenAI LLM Class (as provided) - No changes needed initially
-# Create a custom OpenRouter LLM class
-# Replace the OpenRouter LLM class with an OpenAI implementation
-class OpenAI(LLM):
+# Create a custom LLM class for DeepSeek
+class DeepSeekLLM(LLM):
     api_key: str
-    model: str = "gpt-4o"  # Default to GPT-4o
+    model: str = "deepseek-chat"  # Default to deepseek-chat
     max_tokens: int = 1024
     temperature: float = 0.1
-    openai_api_base: str = "https://api.openai.com/v1/chat/completions"
+    # Use the DeepSeek base URL
+    api_base_url: str = "https://api.deepseek.com/v1"
 
     @property
     def _llm_type(self) -> str:
-        return "openai"
+        # Changed type identifier
+        return "deepseek"
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
         headers = {
@@ -58,13 +58,23 @@ class OpenAI(LLM):
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "messages": [{"role": "user", "content": prompt}]
+            # Note: DeepSeek might expect system prompt differently,
+            # but this structure often works. Add system message if needed:
+            # "messages": [
+            #     {"role": "system", "content": "You are a helpful assistant"},
+            #     {"role": "user", "content": prompt}
+            # ]
         }
 
         if stop:
             payload["stop"] = stop
 
+        # Construct the full URL for the chat completions endpoint
+        request_url = f"{self.api_base_url}/chat/completions"
+
         try:
-            response = requests.post(self.openai_api_base, headers=headers, json=payload)
+            # Use the constructed URL
+            response = requests.post(request_url, headers=headers, json=payload)
             response.raise_for_status() # Raise an exception for bad status codes
         except requests.exceptions.RequestException as e:
              st.error(f"API Request Error: {e}")
@@ -78,16 +88,19 @@ class OpenAI(LLM):
             raise ValueError("Invalid response format from API")
 
         first_choice = response_data['choices'][0]
+        # Adjust based on DeepSeek's exact response structure if different from OpenAI
         message_content = first_choice.get('message', {}).get('content', '')
 
         return message_content
 
     @property
     def _identifying_params(self) -> Mapping[str, Any]:
+        # Include api_base_url if you want it to be part of identifying params
         return {
             "model": self.model,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens
+            "max_tokens": self.max_tokens,
+            "api_base_url": self.api_base_url
         }
 
 # Setup Logging (Keep logging, useful for debugging in Streamlit Cloud logs)
@@ -116,10 +129,6 @@ logger.addHandler(console_handler)
 # file_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 # file_handler.setFormatter(file_format)
 # logger.addHandler(file_handler)
-
-# OpenAI API Configuration
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-DEFAULT_MODEL = "gpt-4o"
 
 # Initialize Embeddings (Using Hugging Face) - Cache this
 @st.cache_resource # Cache the embedding model
@@ -282,7 +291,7 @@ def setup_neo4j_schema(graph):
                 if "already exists" in str(e).lower():
                     logger.warning(f"Index likely already exists: {index}")
                 elif "supported for node properties" in str(e).lower() and "VECTOR INDEX" in index:
-                    logger.warning(f"Vector index creation skipped or failed. Ensure Neo4j version supports vector indexes and has APOC: {index}")
+                    logger.warning(f"Vector index creation skipped or failed. Ensure Neo4j version supports vector indexing and has APOC: {index}")
                     st.warning("Vector index setup might require specific Neo4j version/plugins.")
                 else:
                     logger.error(f"Failed to apply index {index}: {e}", exc_info=True)
@@ -322,19 +331,20 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
             }
             graph.query(query, params=params)
 
-        # Setup OpenAI client
+        # Setup LLM client (using DeepSeekLLM)
         # Ensure API key is valid before proceeding
-        if not api_key or len(api_key) < 10: # Basic check
-            st.error("Invalid or missing OpenAI API Key.")
-            logger.error("Invalid or missing OpenAI API Key for graph creation.")
+        if not api_key: # Basic check
+            st.error("Invalid or missing DeepSeek API Key.")
+            logger.error("Invalid or missing DeepSeek API Key for graph creation.")
             return False # Indicate failure
 
-        openai_client = OpenAI(
+        # Instantiate the DeepSeekLLM class
+        llm_client = DeepSeekLLM(
             api_key=api_key,
-            model=DEFAULT_MODEL,
+            # model= can override default here if needed, e.g., model="deepseek-coder"
             max_tokens=256, # Keep entity extraction concise
-            temperature=0.1,
-            openai_api_base=OPENAI_API_URL
+            temperature=0.1
+            # api_base_url is set in the class definition
         )
 
         # Process each chunk
@@ -385,7 +395,8 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
 
                 JSON RESPONSE (list of objects):
                 """
-                entity_response = openai_client.invoke(entity_prompt)
+                # Use the instantiated client
+                entity_response = llm_client.invoke(entity_prompt)
 
                 # Parse JSON robustly
                 try:
@@ -713,8 +724,8 @@ def answer_question(question, api_key, contexts, neo4j_uri, neo4j_username, neo4
     start_time = time.time()
 
     if not api_key:
-        st.error("OpenAI API Key is missing. Cannot generate answer.")
-        return {"error": "OpenAI API Key is missing."}
+        st.error("DeepSeek API Key is missing. Cannot generate answer.")
+        return {"error": "DeepSeek API Key is missing."}
 
     if not contexts:
          st.warning("No context was retrieved. Attempting to answer based on general knowledge (may be inaccurate).")
@@ -768,11 +779,11 @@ Question: {question}
 
 Answer:"""
 
-        # LLM Call
-        llm = OpenAI(api_key=api_key, model=DEFAULT_MODEL, openai_api_base=OPENAI_API_URL)
+        # LLM Call - Instantiate DeepSeekLLM here
+        llm = DeepSeekLLM(api_key=api_key) # Uses default model "deepseek-chat"
         answer_raw = llm.invoke(prompt)
 
-        # Basic cleaning (already done in LLM class, maybe add more if needed)
+        # Basic cleaning
         cleaned_answer = answer_raw.strip()
 
         end_time = time.time()
@@ -807,8 +818,8 @@ if 'neo4j_username' not in st.session_state:
     st.session_state.neo4j_username = ""
 if 'neo4j_password' not in st.session_state:
     st.session_state.neo4j_password = ""
-if 'openai_api_key' not in st.session_state:
-    st.session_state.openai_api_key = ""
+if 'deepseek_api_key' not in st.session_state:
+    st.session_state.deepseek_api_key = ""
 if 'neo4j_connected' not in st.session_state:
     st.session_state.neo4j_connected = False
 if 'graph_built' not in st.session_state:
@@ -856,21 +867,29 @@ with st.sidebar:
         else:
             st.warning("Please provide all Neo4j connection details.")
 
+
     if st.session_state.neo4j_connected:
         st.success("✅ Neo4j Connected")
     else:
         st.info("Provide Neo4j credentials and click 'Connect'.")
 
 
-    # OpenAI API Key
-    st.subheader("OpenAI API Key")
-    default_api_key = st.secrets.get("OPENAI_API_KEY", "")
-    st.session_state.openai_api_key = st.text_input("API Key", type="password", value=st.session_state.openai_api_key or default_api_key, help="Get from OpenAI platform.")
+    # DeepSeek API Key
+    st.subheader("DeepSeek API Key")
+    # Check st.secrets for the key, otherwise use session state or show empty input
+    default_api_key = st.secrets.get("DEEPSEEK_API_KEY", "") # Use a specific secret if desired
+    st.session_state.deepseek_api_key = st.text_input(
+        "DeepSeek API Key", # Changed label
+        type="password",
+        value=st.session_state.deepseek_api_key or default_api_key, # Use renamed key
+        help="Get from DeepSeek platform." # Changed help text
+    )
 
-    if st.session_state.openai_api_key.startswith("sk-"):
-        st.success("✅ OpenAI Key Provided")
+    # Check if the key looks plausible (basic check)
+    if st.session_state.deepseek_api_key: # Simple check if key exists
+        st.success("✅ DeepSeek Key Provided")
     else:
-        st.info("Provide your OpenAI API key.")
+        st.info("Provide your DeepSeek API key.")
 
 
     # --- File Upload ---
@@ -898,8 +917,8 @@ st.header("1. Process PDFs & Build Knowledge Graph")
 
 if not st.session_state.neo4j_connected:
     st.warning("⚠️ Please connect to Neo4j in the sidebar first.")
-elif not st.session_state.openai_api_key.startswith("sk-"):
-     st.warning("⚠️ Please provide your OpenAI API key in the sidebar.")
+elif not st.session_state.deepseek_api_key:
+     st.warning("⚠️ Please provide your DeepSeek API key in the sidebar.")
 elif not uploaded_files:
     st.info("⬆️ Upload one or more PDF files using the sidebar.")
 elif st.session_state.uploaded_files_processed:
@@ -941,7 +960,7 @@ else:
 
 
             # Create Knowledge Graph structure
-            graph_creation_success = create_knowledge_graph(graph, chunks, source_metadata, st.session_state.openai_api_key)
+            graph_creation_success = create_knowledge_graph(graph, chunks, source_metadata, st.session_state.deepseek_api_key)
             if not graph_creation_success:
                  st.error("Failed during knowledge graph structure creation. Check logs. Stopping.")
                  st.stop()
@@ -994,13 +1013,13 @@ else:
     if st.button("Get Answer"):
         if not question:
             st.warning("Please enter a question.")
-        elif not st.session_state.openai_api_key.startswith("sk-"):
-             st.error("OpenAI API Key missing. Cannot generate answer.")
+        elif not st.session_state.deepseek_api_key:
+             st.error("DeepSeek API Key missing. Cannot generate answer.")
         else:
             with st.spinner("Searching knowledge graph and generating answer..."):
                 # Retrieve necessary components from session state
                 graph_data = st.session_state.graph_data
-                api_key = st.session_state.openai_api_key
+                api_key = st.session_state.deepseek_api_key
 
                 # Get context
                 contexts = get_query_context(
