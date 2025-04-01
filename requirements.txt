@@ -1,0 +1,10 @@
+streamlit
+pandas
+langchain-community>=0.0.31
+langchain>=0.1.13
+pymupdf
+sentence-transformers
+neo4j>=5.10
+openai>=1.0
+# torch # sentence-transformers usually installs this; uncomment if needed
+# python-dotenv # Optional: For local environment variable management
