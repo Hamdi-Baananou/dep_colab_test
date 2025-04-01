@@ -321,19 +321,21 @@ def setup_neo4j_schema(graph):
 
 
 # Define a helper function for concurrent entity extraction
-def extract_entities_task(chunk, api_key, model_name, base_url):
+# Use 'deepseek-chat' specifically for this task
+def extract_entities_task(chunk, api_key, base_url):
     """
     Task function to extract entities for a single chunk using a temporary LLM client.
-    Handles API calls and basic JSON parsing.
+    Handles API calls and basic JSON parsing. Uses 'deepseek-chat'.
     """
     chunk_id = chunk.metadata['chunk_id']
-    logger.debug(f"Starting entity extraction task for chunk {chunk_id}")
+    # Use deepseek-chat for potentially faster extraction
+    model_name_for_extraction = "deepseek-chat"
+    logger.debug(f"Starting entity extraction task for chunk {chunk_id} using model {model_name_for_extraction}")
     try:
         # Create a *new*, temporary LLM instance for this task
-        # Note: This instance won't share history with others or the main Q&A LLM
         temp_llm_client = DeepSeekLLM(
             api_key=api_key,
-            model=model_name, # Use the reasoner or another suitable model
+            model=model_name_for_extraction, # Explicitly use chat model
             max_tokens=256,
             temperature=0.1,
             api_base_url=base_url,
@@ -351,7 +353,7 @@ def extract_entities_task(chunk, api_key, model_name, base_url):
         JSON RESPONSE (list of objects):
         """
         logger.info(f"Attempting LLM entity extraction for chunk {chunk_id}. Prompt length: {len(entity_prompt)}")
-        entity_response = temp_llm_client.invoke(entity_prompt) # Uses the _call method with timeout
+        entity_response = temp_llm_client.invoke(entity_prompt)
         logger.info(f"LLM entity extraction successful for chunk {chunk_id}. Response length: {len(entity_response)}")
 
         # Parse JSON robustly (same logic as before)
@@ -385,9 +387,8 @@ def extract_entities_task(chunk, api_key, model_name, base_url):
         return chunk_id, entities
 
     except Exception as e:
-        logger.error(f"Entity extraction task failed for chunk {chunk_id}: {e}", exc_info=False) # Keep log concise
-        # Return the error to be handled later
-        return chunk_id, e # Return chunk_id and the exception object
+        logger.error(f"Entity extraction task failed for chunk {chunk_id}: {e}", exc_info=False)
+        return chunk_id, e
 
 
 def create_knowledge_graph(graph, chunks, source_metadata, api_key):
@@ -395,51 +396,71 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
     logger.info("Starting knowledge graph creation with concurrent extraction and batched writes.")
     st.info("Building knowledge graph (concurrent/batched)... This can take a while.")
     total_chunks = len(chunks)
-    # Adjust progress steps: 1. Create Chunks, 2. Extract Entities, 3. Batch Write Entities, 4. Link Related
+    # Adjust progress steps: 1. Batch Create Chunks, 2. Extract Entities, 3. Batch Write Entities, 4. Link Related
     progress_bar = st.progress(0, text="Initializing graph build...")
     processed_chunks_extraction = 0
-    processed_batches_write = 0
+    processed_batches_chunk_write = 0
+    processed_batches_entity_write = 0
+    processed_batches_concept_write = 0
 
     # --- Concurrency/Batching Settings ---
-    MAX_WORKERS_EXTRACTION = 5 # Workers for API calls
-    BATCH_SIZE_GRAPH_WRITE = 200 # Number of entity links per transaction batch
-    logger.info(f"Using {MAX_WORKERS_EXTRACTION} workers for extraction, batch size {BATCH_SIZE_GRAPH_WRITE} for graph writes.")
+    MAX_WORKERS_EXTRACTION = 5 # Consider increasing carefully (e.g., 8, 10)
+    BATCH_SIZE_CHUNK_WRITE = 500 # Batch size for creating chunk nodes
+    BATCH_SIZE_ENTITY_WRITE = 200 # Batch size for entity/concept nodes+rels
+    logger.info(f"Using {MAX_WORKERS_EXTRACTION} workers for extraction, batch size {BATCH_SIZE_CHUNK_WRITE} for chunks, {BATCH_SIZE_ENTITY_WRITE} for entities.")
 
-    base_model_name = "deepseek-reasoner"
+    # Store base LLM parameters (API URL) - model is now determined in the task
     base_api_url = "https://api.deepseek.com/v1"
 
-    # --- Step 1: Create Chunk Nodes (Sequential) ---
-    st.info("Creating base chunk nodes in the graph...")
-    logger.info("Creating all chunk nodes sequentially first.")
-    for i, chunk in enumerate(chunks):
-        chunk_id = chunk.metadata['chunk_id']
-        source_doc = chunk.metadata['source_document']
-        page_num = chunk.metadata.get('page', 0)
+    # --- Step 1: Batch Create Chunk Nodes ---
+    st.info("Preparing and batch-creating chunk nodes...")
+    logger.info("Preparing chunk data for batch creation.")
+    chunks_to_write = []
+    for chunk in chunks:
+        chunks_to_write.append({
+            "chunkId": chunk.metadata['chunk_id'],
+            "text": chunk.page_content,
+            "pageNum": chunk.metadata.get('page', 0),
+            "docId": chunk.metadata['source_document']
+        })
+
+    batch_chunk_query = """
+    UNWIND $batch AS item
+    MATCH (d:Document {id: item.docId})
+    MERGE (c:Chunk {id: item.chunkId})
+    ON CREATE SET c.text = item.text, c.page_num = item.pageNum, c.source_document = item.docId
+    ON MATCH SET c.text = item.text, c.page_num = item.pageNum // Update if exists? Optional
+    MERGE (d)-[:CONTAINS]->(c)
+    RETURN count(c) as count
+    """
+
+    total_chunk_batches = (len(chunks_to_write) + BATCH_SIZE_CHUNK_WRITE - 1) // BATCH_SIZE_CHUNK_WRITE
+    logger.info(f"Writing Chunk nodes ({total_chunk_batches} batches)...")
+    for i in range(0, len(chunks_to_write), BATCH_SIZE_CHUNK_WRITE):
+        batch = chunks_to_write[i : i + BATCH_SIZE_CHUNK_WRITE]
+        batch_num = (i // BATCH_SIZE_CHUNK_WRITE) + 1
+        logger.debug(f"Processing Chunk write batch {batch_num}/{total_chunk_batches} ({len(batch)} items)")
         try:
-            query = """
-            MATCH (d:Document {id: $doc_id})
-            MERGE (c:Chunk {id: $chunk_id})
-            SET c.text = $text,
-                c.page_num = $page_num,
-                c.source_document = $doc_id
-            MERGE (d)-[:CONTAINS]->(c)
-            """
-            params = { "chunk_id": chunk_id, "text": chunk.page_content, "page_num": page_num, "doc_id": source_doc }
-            graph.query(query, params=params)
+            graph.query(batch_chunk_query, params={"batch": batch})
         except Exception as e:
-             logger.error(f"Error creating chunk node {chunk_id} or linking: {e}", exc_info=True)
-             st.warning(f"Skipping chunk node creation for {chunk_id} due to error.")
-        progress_bar.progress((i + 1) / (total_chunks * 2), text=f"Creating chunk nodes {i+1}/{total_chunks}") # Approx 25% when done
+             logger.error(f"Error processing Chunk graph write batch {batch_num}: {e}", exc_info=True)
+             st.error(f"Failed to write Chunk batch {batch_num} to graph. Error: {e}")
+             # Consider if this failure is critical enough to stop
+        processed_batches_chunk_write += 1
+        # Update progress (approx 0% -> 25%)
+        progress_bar.progress(processed_batches_chunk_write / (total_chunk_batches * 4), text=f"Creating chunk nodes (batch {processed_batches_chunk_write}/{total_chunk_batches})")
 
     # --- Step 2: Concurrent Entity Extraction ---
     logger.info("Starting concurrent entity extraction.")
     st.info(f"Extracting entities using up to {MAX_WORKERS_EXTRACTION} concurrent workers...")
     results = {} # {chunk_id: entities_or_error}
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS_EXTRACTION) as executor:
+        # Submit all tasks (pass base_api_url, model determined in task)
         future_to_chunk = {
-            executor.submit(extract_entities_task, chunk, api_key, base_model_name, base_api_url): chunk
+            executor.submit(extract_entities_task, chunk, api_key, base_api_url): chunk
             for chunk in chunks
         }
+        # Process completed tasks
         for future in concurrent.futures.as_completed(future_to_chunk):
             chunk = future_to_chunk[future]
             chunk_id = chunk.metadata['chunk_id']
@@ -456,10 +477,11 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
             # Update progress (approx 25% -> 75%)
             progress_bar.progress(0.25 + (processed_chunks_extraction / (total_chunks * 2)), text=f"Extracting entities {processed_chunks_extraction}/{total_chunks}")
 
-    # --- Step 3: Prepare Data for Batch Write ---
+    # --- Step 3: Prepare Data for Batch Write (Separated by Label) ---
     logger.info("Preparing data for batched graph writes.")
     st.info("Preparing extracted entities for batch updates...")
-    entities_to_write = []
+    entity_nodes_to_write = []
+    concept_nodes_to_write = []
     for chunk_id, extracted_data in results.items():
         if isinstance(extracted_data, Exception) or not extracted_data:
             continue # Skip failed or empty extractions
@@ -478,60 +500,79 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
              entity_id = f"{clean_name_part}_{clean_type_part}"[:255]
              node_label = "Concept" if entity_type.lower() in ["concept", "topic"] else "Entity"
 
-             entities_to_write.append({
+             # Prepare data common to both types
+             data = {
                  "chunkId": chunk_id,
                  "entityId": entity_id,
                  "entityName": entity_name,
-                 "entityType": entity_type, # Original type for relationship property
-                 "nodeLabel": node_label # Determined label for the node
-             })
+                 "entityType": entity_type,
+             }
+             # Append to the correct list based on the determined label
+             if node_label == "Entity":
+                 entity_nodes_to_write.append(data)
+             else: # Concept
+                 concept_nodes_to_write.append(data)
 
-    total_entities_to_write = len(entities_to_write)
-    logger.info(f"Prepared {total_entities_to_write} valid entity mentions for graph update.")
+    total_entities = len(entity_nodes_to_write)
+    total_concepts = len(concept_nodes_to_write)
+    logger.info(f"Prepared {total_entities} Entity mentions and {total_concepts} Concept mentions for graph update.")
 
-    # --- Step 4: Execute Batched Graph Writes ---
-    logger.info(f"Executing graph writes in batches of {BATCH_SIZE_GRAPH_WRITE}...")
-    st.info(f"Writing {total_entities_to_write} entity links to graph in batches...")
 
-    # Cypher query using UNWIND for batching
-    # MERGE entity node first, then MERGE the relationship to the existing chunk node
-    batch_write_query = """
+    # --- Step 4: Execute Batched Graph Writes (Separated Queries) ---
+    logger.info(f"Executing graph writes in batches...")
+    st.info(f"Writing {total_entities} Entities and {total_concepts} Concepts to graph in batches...")
+    batch_entity_write_query = """
     UNWIND $batch AS item
-    MERGE (e:`Entity` {id: item.entityId}) // Use a placeholder label first
+    MERGE (e:Entity {id: item.entityId})
     ON CREATE SET e.name = item.entityName, e.type = item.entityType
-    // Remove placeholder label and set the correct one based on input
-    REMOVE e:Entity
-    SET e += item.nodeLabel // Dynamically set the correct label (Entity or Concept)
     WITH e, item
     MATCH (c:Chunk {id: item.chunkId})
     MERGE (c)-[r:MENTIONS {type: item.entityType}]->(e)
-    RETURN count(e) as updated_count // Return something small
+    RETURN count(e) as updated_count
     """
-    # Note: Dynamically setting labels like `SET e:item.nodeLabel` is tricky.
-    # A common workaround is to MERGE with a base label ('Entity' here) and then use SET e += 'CorrectLabel'.
-    # Or use APOC procedures if available (apoc.create.addLabels).
-    # The MERGE + REMOVE + SET approach should work on standard Neo4j.
-
-    total_batches = (total_entities_to_write + BATCH_SIZE_GRAPH_WRITE - 1) // BATCH_SIZE_GRAPH_WRITE
-    for i in range(0, total_entities_to_write, BATCH_SIZE_GRAPH_WRITE):
-        batch = entities_to_write[i : i + BATCH_SIZE_GRAPH_WRITE]
-        batch_num = (i // BATCH_SIZE_GRAPH_WRITE) + 1
-        logger.info(f"Processing write batch {batch_num}/{total_batches} ({len(batch)} items)")
+    batch_concept_write_query = """
+    UNWIND $batch AS item
+    MERGE (e:Concept {id: item.entityId})
+    ON CREATE SET e.name = item.entityName, e.type = item.entityType
+    WITH e, item
+    MATCH (c:Chunk {id: item.chunkId})
+    MERGE (c)-[r:MENTIONS {type: item.entityType}]->(e)
+    RETURN count(e) as updated_count
+    """
+    total_entity_batches = (total_entities + BATCH_SIZE_ENTITY_WRITE - 1) // BATCH_SIZE_ENTITY_WRITE
+    logger.info(f"Writing Entities ({total_entity_batches} batches)...")
+    for i in range(0, total_entities, BATCH_SIZE_ENTITY_WRITE):
+        batch = entity_nodes_to_write[i : i + BATCH_SIZE_ENTITY_WRITE]
+        batch_num = (i // BATCH_SIZE_ENTITY_WRITE) + 1
+        logger.debug(f"Processing Entity write batch {batch_num}/{total_entity_batches} ({len(batch)} items)")
         try:
-            graph.query(batch_write_query, params={"batch": batch})
+            graph.query(batch_entity_write_query, params={"batch": batch})
         except Exception as e:
-            logger.error(f"Error processing graph write batch {batch_num}: {e}", exc_info=True)
-            st.error(f"Failed to write batch {batch_num} to graph. Some entities might be missing. Error: {e}")
-            # Optionally: Decide whether to stop or continue on batch failure
-            # continue
-        processed_batches_write += 1
-        # Update progress (approx 75% -> 95%)
-        progress_bar.progress(0.75 + (processed_batches_write / (total_batches * 4)), text=f"Writing batches to graph {processed_batches_write}/{total_batches}")
+            logger.error(f"Error processing Entity graph write batch {batch_num}: {e}", exc_info=True)
+            st.error(f"Failed to write Entity batch {batch_num} to graph. Error: {e}")
+        processed_batches_entity_write += 1
+        progress = 0.75 + (processed_batches_entity_write / (total_entity_batches * 8))
+        progress_bar.progress(progress , text=f"Writing Entity batches {processed_batches_entity_write}/{total_entity_batches}")
+
+    total_concept_batches = (total_concepts + BATCH_SIZE_ENTITY_WRITE - 1) // BATCH_SIZE_ENTITY_WRITE
+    logger.info(f"Writing Concepts ({total_concept_batches} batches)...")
+    for i in range(0, total_concepts, BATCH_SIZE_ENTITY_WRITE):
+        batch = concept_nodes_to_write[i : i + BATCH_SIZE_ENTITY_WRITE]
+        batch_num = (i // BATCH_SIZE_ENTITY_WRITE) + 1
+        logger.debug(f"Processing Concept write batch {batch_num}/{total_concept_batches} ({len(batch)} items)")
+        try:
+            graph.query(batch_concept_write_query, params={"batch": batch})
+        except Exception as e:
+            logger.error(f"Error processing Concept graph write batch {batch_num}: {e}", exc_info=True)
+            st.error(f"Failed to write Concept batch {batch_num} to graph. Error: {e}")
+        processed_batches_concept_write += 1
+        progress = 0.85 + (processed_batches_concept_write / (total_concept_batches * 8))
+        progress_bar.progress(progress, text=f"Writing Concept batches {processed_batches_concept_write}/{total_concept_batches}")
 
 
     # --- Step 5: Link Related Entities (Sequential) ---
     progress_bar.progress(0.95, text="Linking related entities...")
-    logger.info("Creating connections between related entities within the same chunk context...")
+    logger.info("Creating connections between related entities...")
     try:
         query = """
         MATCH (c:Chunk)-[:MENTIONS]->(e1)
@@ -550,7 +591,7 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
     progress_bar.progress(1.0, text="Knowledge graph structure build completed!")
     st.success("Knowledge graph structure built successfully!")
     progress_bar.empty()
-    return True # Indicate success
+    return True
 
 def setup_vector_index(chunks, embedding_function, neo4j_uri, neo4j_username, neo4j_password):
     """Setup vector embeddings in Neo4j for semantic search"""
