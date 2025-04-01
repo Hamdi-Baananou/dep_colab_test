@@ -36,15 +36,14 @@ import requests
 # Create a custom LLM class for DeepSeek
 class DeepSeekLLM(LLM):
     api_key: str
-    model: str = "deepseek-chat"  # Default to deepseek-chat
+    model: str = "deepseek-reasoner"  # Changed default to reasoner
     max_tokens: int = 1024
     temperature: float = 0.1
-    # Use the DeepSeek base URL
+    messages: List[Dict[str, str]] = []  # Add message history
     api_base_url: str = "https://api.deepseek.com/v1"
 
     @property
     def _llm_type(self) -> str:
-        # Changed type identifier
         return "deepseek"
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
@@ -53,17 +52,14 @@ class DeepSeekLLM(LLM):
             "Content-Type": "application/json"
         }
 
+        # Add the new prompt to message history
+        self.messages.append({"role": "user", "content": prompt})
+
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-            "messages": [{"role": "user", "content": prompt}]
-            # Note: DeepSeek might expect system prompt differently,
-            # but this structure often works. Add system message if needed:
-            # "messages": [
-            #     {"role": "system", "content": "You are a helpful assistant"},
-            #     {"role": "user", "content": prompt}
-            # ]
+            "messages": self.messages
         }
 
         if stop:
@@ -73,9 +69,8 @@ class DeepSeekLLM(LLM):
         request_url = f"{self.api_base_url}/chat/completions"
 
         try:
-            # Use the constructed URL
             response = requests.post(request_url, headers=headers, json=payload)
-            response.raise_for_status() # Raise an exception for bad status codes
+            response.raise_for_status()
         except requests.exceptions.RequestException as e:
              st.error(f"API Request Error: {e}")
              logger.error(f"API Request Error: {e}", exc_info=True)
@@ -88,14 +83,19 @@ class DeepSeekLLM(LLM):
             raise ValueError("Invalid response format from API")
 
         first_choice = response_data['choices'][0]
-        # Adjust based on DeepSeek's exact response structure if different from OpenAI
         message_content = first_choice.get('message', {}).get('content', '')
+        
+        # Add assistant's response to message history
+        self.messages.append({"role": "assistant", "content": message_content})
 
         return message_content
 
+    def clear_history(self):
+        """Clear the message history"""
+        self.messages = []
+
     @property
     def _identifying_params(self) -> Mapping[str, Any]:
-        # Include api_base_url if you want it to be part of identifying params
         return {
             "model": self.model,
             "temperature": self.temperature,
@@ -718,7 +718,7 @@ def get_query_context(question, vector_store, graph):
 
 
 def answer_question(question, api_key, contexts, neo4j_uri, neo4j_username, neo4j_password):
-    """Generate answer based on retrieved contexts using OpenAI API"""
+    """Generate answer based on retrieved contexts using DeepSeek API"""
     logger.info(f"Generating answer for question: {question}")
     st.info("Synthesizing answer using retrieved context...")
     start_time = time.time()
@@ -779,9 +779,12 @@ Question: {question}
 
 Answer:"""
 
-        # LLM Call - Instantiate DeepSeekLLM here
-        llm = DeepSeekLLM(api_key=api_key) # Uses default model "deepseek-chat"
-        answer_raw = llm.invoke(prompt)
+        # LLM Call - Use session state to maintain conversation history
+        if 'llm' not in st.session_state:
+            st.session_state.llm = DeepSeekLLM(api_key=api_key)
+        
+        # Get the answer
+        answer_raw = st.session_state.llm.invoke(prompt)
 
         # Basic cleaning
         cleaned_answer = answer_raw.strip()
@@ -1008,6 +1011,12 @@ st.header("2. Ask Questions")
 if not st.session_state.graph_built or not st.session_state.graph_data:
     st.info("☝️ Please process PDF files first to enable the Q&A section.")
 else:
+    # Add clear history button
+    if st.button("Clear Conversation History"):
+        if 'llm' in st.session_state:
+            st.session_state.llm.clear_history()
+            st.success("Conversation history cleared!")
+
     question = st.text_area("Enter your question about the documents:", height=100)
 
     if st.button("Get Answer"):
