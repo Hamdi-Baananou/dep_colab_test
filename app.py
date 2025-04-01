@@ -53,27 +53,39 @@ class DeepSeekLLM(LLM):
         }
 
         # Add the new prompt to message history
+        # Only add history if the class instance is intended for conversation
+        # For the temporary client in create_knowledge_graph, this might not be desired
+        # We'll keep it for now, but be aware it affects the temporary client too.
         self.messages.append({"role": "user", "content": prompt})
 
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
+            # Use the current message history for the payload
             "messages": self.messages
         }
 
         if stop:
             payload["stop"] = stop
 
-        # Construct the full URL for the chat completions endpoint
         request_url = f"{self.api_base_url}/chat/completions"
 
         try:
-            response = requests.post(request_url, headers=headers, json=payload)
+            # ADD TIMEOUT HERE (e.g., 60 seconds)
+            response = requests.post(request_url, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
+        # CATCH TIMEOUT EXCEPTION
+        except requests.exceptions.Timeout:
+            logger.error(f"API Request timed out after 60 seconds for model {self.model}.")
+            st.error("API request timed out. The service might be slow or unavailable.")
+            # Re-raise or return an error indicator
+            raise ValueError("API Timeout")
         except requests.exceptions.RequestException as e:
              st.error(f"API Request Error: {e}")
              logger.error(f"API Request Error: {e}", exc_info=True)
+             # Clear messages potentially causing issues if request fails badly? Optional.
+             # self.messages.pop() # Remove the last user message if it caused the error
              raise ValueError(f"API Error: {e}")
 
         response_data = response.json()
@@ -86,6 +98,8 @@ class DeepSeekLLM(LLM):
         message_content = first_choice.get('message', {}).get('content', '')
         
         # Add assistant's response to message history
+        # Only add history if the class instance is intended for conversation
+        # For the temporary client, this might build up unnecessarily.
         self.messages.append({"role": "assistant", "content": message_content})
 
         return message_content
@@ -395,8 +409,18 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
 
                 JSON RESPONSE (list of objects):
                 """
+                # ADD LOGGING HERE
+                logger.info(f"Attempting LLM entity extraction for chunk {chunk_id}. Prompt length: {len(entity_prompt)}")
+                # Log first few chars of the prompt content (be careful with sensitive data if any)
+                logger.debug(f"Prompt preview for chunk {chunk_id}: {entity_prompt[:200]}...")
+
                 # Use the instantiated client
                 entity_response = llm_client.invoke(entity_prompt)
+
+                # ADD LOGGING HERE
+                logger.info(f"LLM entity extraction successful for chunk {chunk_id}. Response length: {len(entity_response)}")
+                logger.debug(f"Response preview for chunk {chunk_id}: {entity_response[:200]}...")
+
 
                 # Parse JSON robustly
                 try:
@@ -430,9 +454,11 @@ def create_knowledge_graph(graph, chunks, source_metadata, api_key):
                     entities = []
 
             except Exception as llm_e:
+                 # Log the specific error encountered (ValueError from timeout/API error, or others)
                  logger.error(f"LLM call failed for entity extraction on chunk {chunk_id}: {llm_e}", exc_info=True)
-                 st.warning(f"Skipping entity extraction for chunk {chunk_id} due to LLM error.")
-                 # Continue processing other chunks even if LLM fails for one
+                 st.warning(f"Skipping entity extraction for chunk {chunk_id} due to LLM/API error: {llm_e}")
+                 # Ensure the loop continues to the next chunk
+                 continue # <--- ADD OR ENSURE THIS IS PRESENT
 
             # Create entity nodes and relationships if entities were extracted
             if entities:
